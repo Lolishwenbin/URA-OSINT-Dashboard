@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>URA OSINT Monitor - Talons Laboratories</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%231E3A5F'/><text x='16' y='22' text-anchor='middle' fill='white' font-size='18' font-weight='bold'>T</text></svg>">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Inter',-apple-system,sans-serif;background:#F8FAFC;min-height:100vh}
+input,select,textarea,button{font-family:inherit}
+::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#CBD5E1;border-radius:3px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner{border:2px solid #E2E8F0;border-top-color:#1E3A5F;border-radius:50%;width:16px;height:16px;animation:spin 0.8s linear infinite;display:inline-block;vertical-align:middle}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useCallback}=React;
+
+// ===== BACKEND CONFIG =====
+const API_BASE = "http://localhost:8000";
+
+const priorityColors={High:{bg:"#FEE2E2",text:"#991B1B",dot:"#EF4444"},Medium:{bg:"#FEF3C7",text:"#92400E",dot:"#F59E0B"},Low:{bg:"#D1FAE5",text:"#065F46",dot:"#10B981"}};
+const sourceColors={carousell:{bg:"#EDE9FE",text:"#5B21B6"},facebook_marketplace:{bg:"#DBEAFE",text:"#1E40AF"},xiaohongshu:{bg:"#FCE7F3",text:"#9D174D"},telegram:{bg:"#CCFBF1",text:"#0F766E"}};
+const issueColors={"Short-term Accommodation":{bg:"#DBEAFE",text:"#1E40AF"},"Unauthorised Dormitory":{bg:"#FDE68A",text:"#92400E"},"Short-term + Dormitory":{bg:"#FECACA",text:"#991B1B"},"Unclassified":{bg:"#F1F5F9",text:"#475569"}};
+const propColors={"HDB":{bg:"#E0E7FF",text:"#3730A3"},"Condo / EC":{bg:"#D1FAE5",text:"#065F46"},"Landed":{bg:"#FCE7F3",text:"#9D174D"},"Shophouse":{bg:"#FEF3C7",text:"#92400E"},"Unknown":{bg:"#F1F5F9",text:"#64748B"}};
+const reviewStatuses=["Pending","Relevant Lead","Not Relevant","Duplicate","Insufficient Info","Follow-up Required","Escalate"];
+const reviewColors={"Pending":{bg:"#F1F5F9",text:"#64748B"},"Relevant Lead":{bg:"#D1FAE5",text:"#065F46"},"Not Relevant":{bg:"#FEE2E2",text:"#991B1B"},"Duplicate":{bg:"#E0E7FF",text:"#3730A3"},"Insufficient Info":{bg:"#FEF3C7",text:"#92400E"},"Follow-up Required":{bg:"#DBEAFE",text:"#1E40AF"},"Escalate":{bg:"#FECACA",text:"#B91C1C"}};
+
+const SUGGESTED_KEYWORDS = [
+  "bed space rent",
+  "worker dormitory Singapore",
+  "short term room rental",
+  "no deposit room rent",
+  "bunk bed room rent",
+  "daily rental room",
+  "monthly room rental cheap",
+  "flexible lease Singapore",
+  "短租 房间",
+  "床位 出租"
+];
+
+function Tag({label,colors}){return <span style={{display:"inline-block",padding:"2px 7px",borderRadius:4,fontSize:10,fontWeight:600,background:colors.bg,color:colors.text,letterSpacing:"0.2px"}}>{label}</span>}
+
+function Completeness({pct}){
+  const color=pct>=80?"#10B981":pct>=50?"#F59E0B":"#EF4444";
+  return <div style={{display:"flex",alignItems:"center",gap:6}}>
+    <div style={{width:60,height:5,background:"#E2E8F0",borderRadius:3,overflow:"hidden"}}><div style={{width:pct+"%",height:"100%",background:color,borderRadius:3}}/></div>
+    <span style={{fontSize:10,color:"#64748B"}}>{pct}%</span>
+  </div>
+}
+
+function App(){
+  const [data,setData]=useState([]);
+  const [stats,setStats]=useState({total:0,high:0,medium:0,low:0,short_term:0,dormitory:0,reviewed:0,pending:0});
+  const [filterPriority,setFilterPriority]=useState("ALL");
+  const [filterIssue,setFilterIssue]=useState("ALL");
+  const [filterProp,setFilterProp]=useState("ALL");
+  const [filterReview,setFilterReview]=useState("ALL");
+  const [searchTerm,setSearchTerm]=useState("");
+  const [selectedListing,setSelectedListing]=useState(null);
+  const [tab,setTab]=useState("listings");
+  const [keywordInput,setKeywordInput]=useState("");
+  const [searchRunning,setSearchRunning]=useState(false);
+  const [searchMsg,setSearchMsg]=useState("");
+  const [backendStatus,setBackendStatus]=useState("checking");
+  const [loading,setLoading]=useState(true);
+
+  const loadListings=useCallback(async()=>{
+    try{
+      const params=new URLSearchParams();
+      if(filterPriority!=="ALL") params.append("priority",filterPriority);
+      if(filterIssue!=="ALL") params.append("suspected_issue",filterIssue);
+      if(filterProp!=="ALL") params.append("property_type",filterProp);
+      if(filterReview!=="ALL") params.append("review_status",filterReview);
+      if(searchTerm) params.append("search",searchTerm);
+      const res=await fetch(`${API_BASE}/listings?${params}`);
+      const listings=await res.json();
+      setData(Array.isArray(listings)?listings:[]);
+      setBackendStatus("connected");
+    }catch(e){
+      setBackendStatus("disconnected");
+      setData([]);
+    }
+    setLoading(false);
+  },[filterPriority,filterIssue,filterProp,filterReview,searchTerm]);
+
+  const loadStats=useCallback(async()=>{
+    try{
+      const res=await fetch(`${API_BASE}/stats`);
+      const s=await res.json();
+      setStats(s);
+    }catch(e){}
+  },[]);
+
+  useEffect(()=>{loadListings();loadStats()},[loadListings,loadStats]);
+
+  const runSearch=async()=>{
+    if(!keywordInput.trim()) return;
+    setSearchRunning(true);
+    setSearchMsg("");
+    const keywords=keywordInput.split(",").map(k=>k.trim()).filter(k=>k);
+    try{
+      const res=await fetch(`${API_BASE}/search`,{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({keywords,platform:"carousell",max_results:10})
+      });
+      const result=await res.json();
+      setSearchMsg(`Scraped ${result.raw_scraped}, added ${result.added} new leads.`);
+      setKeywordInput("");
+      await loadListings();
+      await loadStats();
+    }catch(e){
+      setSearchMsg("Search failed. Check the backend is running.");
+    }
+    setSearchRunning(false);
+    setTimeout(()=>setSearchMsg(""),5000);
+  };
+
+  const updateReview=async(listingId,status)=>{
+    try{
+      await fetch(`${API_BASE}/listings/${listingId}/review`,{
+        method:"PUT",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({review_status:status})
+      });
+      await loadListings();
+      await loadStats();
+    }catch(e){}
+  };
+
+  const exportCSV=()=>{
+    const params=new URLSearchParams();
+    if(filterPriority!=="ALL") params.append("priority",filterPriority);
+    if(filterIssue!=="ALL") params.append("suspected_issue",filterIssue);
+    if(filterProp!=="ALL") params.append("property_type",filterProp);
+    if(filterReview!=="ALL") params.append("review_status",filterReview);
+    window.open(`${API_BASE}/export/csv?${params}`,"_blank");
+  };
+
+  const exportJSON=()=>{
+    const params=new URLSearchParams();
+    if(filterPriority!=="ALL") params.append("priority",filterPriority);
+    if(filterIssue!=="ALL") params.append("suspected_issue",filterIssue);
+    if(filterProp!=="ALL") params.append("property_type",filterProp);
+    if(filterReview!=="ALL") params.append("review_status",filterReview);
+    window.open(`${API_BASE}/export/json?${params}`,"_blank");
+  };
+
+  return <div style={{padding:"24px 28px",maxWidth:1200,margin:"0 auto"}}>
+    {/* Header */}
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:24}}>
+      <div style={{display:"flex",alignItems:"center",gap:14}}>
+        <div style={{width:40,height:40,background:"#1E3A5F",borderRadius:10,display:"flex",alignItems:"center",justifyContent:"center",color:"white",fontWeight:700,fontSize:20}}>T</div>
+        <div>
+          <div style={{fontSize:20,fontWeight:700,color:"#0F172A",letterSpacing:"-0.3px"}}>URA OSINT Monitor</div>
+          <div style={{fontSize:12,color:"#94A3B8",marginTop:1}}>Illegal Accommodation Detection Platform / Talons Laboratories</div>
+        </div>
+      </div>
+      <div style={{fontSize:11,textAlign:"right"}}>
+        <div style={{display:"inline-flex",alignItems:"center",gap:6,padding:"4px 10px",borderRadius:6,background:backendStatus==="connected"?"#D1FAE5":backendStatus==="checking"?"#FEF3C7":"#FEE2E2",color:backendStatus==="connected"?"#065F46":backendStatus==="checking"?"#92400E":"#991B1B"}}>
+          <div style={{width:6,height:6,borderRadius:"50%",background:backendStatus==="connected"?"#10B981":backendStatus==="checking"?"#F59E0B":"#EF4444"}}/>
+          <span style={{fontWeight:500}}>{backendStatus==="connected"?"Backend Connected":backendStatus==="checking"?"Connecting...":"Backend Offline"}</span>
+        </div>
+        <div style={{fontSize:10,color:"#94A3B8",marginTop:4}}>{new Date().toLocaleDateString("en-SG",{day:"numeric",month:"short",year:"numeric"})}</div>
+      </div>
+    </div>
+
+    {/* SEARCH BAR */}
+    <div style={{background:"white",borderRadius:12,padding:"18px 22px",marginBottom:20,boxShadow:"0 1px 3px rgba(0,0,0,0.06)",border:"1px solid #E2E8F0"}}>
+      <div style={{fontSize:13,fontWeight:600,color:"#334155",marginBottom:10}}>Scrape Carousell</div>
+      <div style={{display:"flex",gap:8,alignItems:"center"}}>
+        <input type="text" placeholder="Enter keywords (comma separated for multiple)" value={keywordInput} onChange={e=>setKeywordInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter") runSearch()}} disabled={searchRunning} style={{flex:1,padding:"9px 14px",borderRadius:7,border:"1px solid #E2E8F0",fontSize:13,outline:"none",background:searchRunning?"#F8FAFC":"white"}}/>
+        <button onClick={runSearch} disabled={searchRunning||!keywordInput.trim()} style={{padding:"9px 22px",borderRadius:7,border:"none",background:searchRunning||!keywordInput.trim()?"#94A3B8":"#1E3A5F",color:"white",fontSize:13,fontWeight:500,cursor:searchRunning||!keywordInput.trim()?"not-allowed":"pointer",display:"flex",alignItems:"center",gap:8}}>
+          {searchRunning?<><span className="spinner"/>Scraping...</>:"Search"}
+        </button>
+      </div>
+      <div style={{marginTop:10,display:"flex",flexWrap:"wrap",gap:6,alignItems:"center"}}>
+        <span style={{fontSize:10,color:"#94A3B8",fontWeight:500}}>Quick keywords:</span>
+        {SUGGESTED_KEYWORDS.map(kw=>
+          <button key={kw} onClick={()=>setKeywordInput(kw)} style={{padding:"3px 9px",borderRadius:12,border:"1px solid #E2E8F0",background:"white",fontSize:10,cursor:"pointer",color:"#475569"}}>{kw}</button>
+        )}
+      </div>
+      {searchMsg&&<div style={{marginTop:8,fontSize:11,color:"#065F46",fontWeight:500}}>{searchMsg}</div>}
+    </div>
+
+    {/* Tabs */}
+    <div style={{display:"flex",gap:0,marginBottom:20,borderBottom:"2px solid #E2E8F0"}}>
+      {[["listings","Listings"],["stats","Summary"]].map(([key,label])=>
+        <button key={key} onClick={()=>setTab(key)} style={{padding:"8px 20px",fontSize:13,fontWeight:tab===key?600:400,color:tab===key?"#1E3A5F":"#94A3B8",background:"none",border:"none",borderBottom:tab===key?"2px solid #1E3A5F":"2px solid transparent",marginBottom:-2,cursor:"pointer"}}>{label}</button>
+      )}
+    </div>
+
+    {tab==="stats"&&<div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(150px, 1fr))",gap:10,marginBottom:20}}>
+        {[{l:"Total Listings",v:stats.total,c:"#1E3A5F"},{l:"High Priority",v:stats.high,c:"#EF4444"},{l:"Medium Priority",v:stats.medium,c:"#F59E0B"},{l:"Low Priority",v:stats.low,c:"#10B981"},{l:"Short-term",v:stats.short_term,c:"#3B82F6"},{l:"Dormitory",v:stats.dormitory,c:"#8B5CF6"},{l:"Reviewed",v:stats.reviewed,c:"#059669"},{l:"Pending",v:stats.pending,c:"#DC2626"}].map((s,i)=>
+          <div key={i} style={{background:"white",borderRadius:10,padding:"14px 16px",boxShadow:"0 1px 2px rgba(0,0,0,0.05)",borderTop:"3px solid "+s.c}}>
+            <div style={{fontSize:28,fontWeight:700,color:s.c,lineHeight:1}}>{s.v}</div>
+            <div style={{fontSize:11,color:"#94A3B8",marginTop:4}}>{s.l}</div>
+          </div>
+        )}
+      </div>
+    </div>}
+
+    {tab==="listings"&&<div>
+      {/* Quick stats */}
+      <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
+        {[{l:"Total",v:stats.total,c:"#1E3A5F"},{l:"High",v:stats.high,c:"#EF4444"},{l:"Medium",v:stats.medium,c:"#F59E0B"},{l:"Low",v:stats.low,c:"#10B981"}].map((s,i)=>
+          <div key={i} style={{background:"white",borderRadius:8,padding:"8px 14px",boxShadow:"0 1px 2px rgba(0,0,0,0.04)",display:"flex",alignItems:"center",gap:8}}>
+            <span style={{fontSize:18,fontWeight:700,color:s.c}}>{s.v}</span>
+            <span style={{fontSize:11,color:"#94A3B8"}}>{s.l}</span>
+          </div>
+        )}
+      </div>
+
+      {/* Filters */}
+      <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:14,alignItems:"center"}}>
+        <input type="text" placeholder="Filter existing..." value={searchTerm} onChange={e=>setSearchTerm(e.target.value)} style={{padding:"7px 12px",borderRadius:7,border:"1px solid #E2E8F0",fontSize:12,outline:"none",background:"white",width:160}}/>
+        <select value={filterPriority} onChange={e=>setFilterPriority(e.target.value)} style={{padding:"7px 10px",borderRadius:7,border:"1px solid #E2E8F0",fontSize:12,background:"white"}}>
+          <option value="ALL">All Priority</option><option value="High">High</option><option value="Medium">Medium</option><option value="Low">Low</option>
+        </select>
+        <select value={filterIssue} onChange={e=>setFilterIssue(e.target.value)} style={{padding:"7px 10px",borderRadius:7,border:"1px solid #E2E8F0",fontSize:12,background:"white"}}>
+          <option value="ALL">All Issues</option><option value="Short-term">Short-term</option><option value="Dormitory">Dormitory</option>
+        </select>
+        <select value={filterProp} onChange={e=>setFilterProp(e.target.value)} style={{padding:"7px 10px",borderRadius:7,border:"1px solid #E2E8F0",fontSize:12,background:"white"}}>
+          <option value="ALL">All Property</option><option value="HDB">HDB</option><option value="Condo / EC">Condo</option><option value="Landed">Landed</option><option value="Shophouse">Shophouse</option><option value="Unknown">Unknown</option>
+        </select>
+        <select value={filterReview} onChange={e=>setFilterReview(e.target.value)} style={{padding:"7px 10px",borderRadius:7,border:"1px solid #E2E8F0",fontSize:12,background:"white"}}>
+          <option value="ALL">All Status</option>{reviewStatuses.map(s=><option key={s} value={s}>{s}</option>)}
+        </select>
+        <div style={{marginLeft:"auto",display:"flex",gap:6}}>
+          <button onClick={exportCSV} style={{padding:"7px 14px",borderRadius:7,border:"1px solid #E2E8F0",background:"white",fontSize:11,cursor:"pointer",color:"#475569"}}>Export CSV</button>
+          <button onClick={exportJSON} style={{padding:"7px 14px",borderRadius:7,border:"none",background:"#1E3A5F",color:"white",fontSize:11,cursor:"pointer"}}>Export JSON</button>
+        </div>
+      </div>
+
+      <div style={{fontSize:12,color:"#94A3B8",marginBottom:10}}>Showing {data.length} listings</div>
+
+      {loading&&<div style={{textAlign:"center",padding:32}}><span className="spinner"/></div>}
+
+      {!loading&&backendStatus==="disconnected"&&<div style={{textAlign:"center",padding:48,color:"#991B1B",background:"#FEE2E2",borderRadius:10,fontSize:13}}>
+        Backend is offline. Start the server with <code style={{background:"white",padding:"2px 6px",borderRadius:3}}>py run.py</code> from the ura-osint folder.
+      </div>}
+
+      {/* Listing Cards */}
+      {!loading&&data.map((item,i)=>{
+        const pri=priorityColors[item.priority]||priorityColors.Low;
+        const src=sourceColors[item.source]||{bg:"#F1F5F9",text:"#475569"};
+        const iss=issueColors[item.suspected_issue]||issueColors.Unclassified;
+        const prop=propColors[item.property_type]||propColors.Unknown;
+        const rev=reviewColors[item.review_status]||reviewColors.Pending;
+        const isOpen=selectedListing===item.id;
+
+        return <div key={item.id||i} onClick={()=>setSelectedListing(isOpen?null:item.id)} style={{background:"white",borderRadius:10,padding:"14px 18px",boxShadow:isOpen?"0 2px 8px rgba(0,0,0,0.08)":"0 1px 2px rgba(0,0,0,0.04)",cursor:"pointer",transition:"box-shadow 0.15s",borderLeft:"4px solid "+pri.dot,marginBottom:8}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12}}>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:13,fontWeight:600,color:"#0F172A",marginBottom:6,lineHeight:1.4}}>{item.raw_text}</div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:4,alignItems:"center"}}>
+                <Tag label={item.priority+" Priority"} colors={pri}/>
+                <Tag label={item.source} colors={src}/>
+                <Tag label={item.suspected_issue} colors={iss}/>
+                <Tag label={item.property_type} colors={prop}/>
+                <Tag label={item.review_status} colors={rev}/>
+                {item.raw_location_text&&<span style={{fontSize:11,color:"#64748B",marginLeft:2}}>{item.raw_location_text}</span>}
+              </div>
+            </div>
+            <div style={{textAlign:"right",flexShrink:0}}>
+              <div style={{fontSize:15,fontWeight:700,color:"#0F172A"}}>{item.raw_price_text||"No price"}</div>
+              {item.poster_handle&&<div style={{fontSize:10,color:"#94A3B8",marginTop:2}}>@{item.poster_handle}</div>}
+              <div style={{marginTop:4}}><Completeness pct={item.completeness}/></div>
+            </div>
+          </div>
+
+          {isOpen&&<div style={{marginTop:14,paddingTop:14,borderTop:"1px solid #F1F5F9"}} onClick={e=>e.stopPropagation()}>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+              {[["Advertised Duration",item.advertised_duration],["Property Type",item.property_type],["Suspected Issue",item.suspected_issue],["Language",(item.language_detected||"unknown").toUpperCase()]].map(([label,val],di)=>
+                <div key={di}><span style={{fontSize:10,fontWeight:600,color:"#94A3B8"}}>{label}</span><div style={{fontSize:12,color:"#334155",marginTop:2}}>{val}</div></div>
+              )}
+            </div>
+
+            {item.keywords_matched&&item.keywords_matched.length>0&&<div style={{marginBottom:10}}>
+              <span style={{fontSize:10,fontWeight:600,color:"#94A3B8"}}>Keywords Matched (by AI)</span>
+              <div style={{marginTop:4,display:"flex",flexWrap:"wrap",gap:4}}>{item.keywords_matched.map((kw,ki)=><Tag key={ki} label={kw} colors={{bg:"#EFF6FF",text:"#1D4ED8"}}/>)}</div>
+            </div>}
+
+            {item.notes&&<div style={{marginBottom:10}}>
+              <span style={{fontSize:10,fontWeight:600,color:"#94A3B8"}}>AI Analysis</span>
+              <div style={{fontSize:12,color:"#334155",marginTop:2,padding:"8px 12px",background:"#F8FAFC",borderRadius:6,borderLeft:"3px solid #1E3A5F"}}>{item.notes}</div>
+            </div>}
+
+            <div style={{display:"flex",gap:16,fontSize:11,color:"#94A3B8",marginBottom:12}}>
+              <span>Scraped: {new Date(item.scraped_at).toLocaleDateString("en-SG")}</span>
+              <span>Completeness: {item.completeness}%</span>
+            </div>
+
+            {item.post_url&&<a href={item.post_url} target="_blank" rel="noopener noreferrer" style={{display:"inline-block",fontSize:12,color:"#1E3A5F",textDecoration:"none",fontWeight:500,marginBottom:14}}>View original listing &#8599;</a>}
+
+            <div style={{borderTop:"1px solid #F1F5F9",paddingTop:12}}>
+              <div style={{fontSize:10,fontWeight:600,color:"#94A3B8",marginBottom:8}}>Review Action</div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                {reviewStatuses.filter(s=>s!=="Pending").map(status=>{
+                  const rc=reviewColors[status];
+                  const isActive=item.review_status===status;
+                  return <button key={status} onClick={()=>updateReview(item.id,isActive?"Pending":status)} style={{padding:"5px 12px",borderRadius:6,border:isActive?"2px solid "+rc.text:"1px solid #E2E8F0",background:isActive?rc.bg:"white",fontSize:11,cursor:"pointer",color:isActive?rc.text:"#64748B",fontWeight:isActive?600:400}}>{status}</button>
+                })}
+              </div>
+            </div>
+          </div>}
+        </div>
+      })}
+
+      {!loading&&backendStatus==="connected"&&!data.length&&<div style={{textAlign:"center",padding:48,color:"#94A3B8",fontSize:13}}>No listings yet. Enter keywords above and click Search to scrape Carousell.</div>}
+    </div>}
+
+    <div style={{textAlign:"center",padding:"28px 0 12px",fontSize:11,color:"#CBD5E1"}}>Talons Laboratories - URA OSINT Monitoring Platform MVP</div>
+  </div>
+}
+
+ReactDOM.render(<App/>,document.getElementById("root"));
+</script>
+</body>
+</html>
